@@ -574,8 +574,17 @@ fn create() -> windows::core::Result<Host> {
             .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
             .is_ok()
         {
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            let max = std::env::var("VICTORY_HOST_MAX_WAVE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(o1.WaveLaneCountMax);
+            tracing::info!(
+                min = o1.WaveLaneCountMin,
+                max = o1.WaveLaneCountMax,
+                used = max,
+                "host wave lanes"
+            );
+            victory_shader::emit::set_host_max_wave(max);
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())

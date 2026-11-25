@@ -508,32 +508,43 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
+/// Shader-visible view heap size on tier-3 hardware (such as AMD RDNA 4),
+/// matching `SLOT_STRIDES_COUNT` (`2,097,152`): large enough to hold all
+/// title + dynamic slots with room at the end for a dedicated null guard
+/// slot (`TIER3_VIEWS - 1`), because RDNA 4 GPU-page-faults on unclamped
+/// out-of-bounds bindless descriptor reads instead of returning zeros.
+const TIER3_VIEWS: u32 = victory_shader::emit::SLOT_STRIDES_COUNT;
+/// Maximum shader-visible sampler heap slots (`shader.rs` clamps sampler
+/// indices to `2047`, so the host sampler heap is sized to at least 2,048).
+const MAX_SAMPLERS: u32 = 2_048;
 
-/// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
-/// and if so tells the translator now (`set_view_heap_limit`) instead of
-/// when the title's heap is made: a shader keeps the limit it was
-/// translated with, and the title makes 25 pipelines (their
-/// shaders translated at once) before it makes its view heap. Those would
-/// read a view index past the heap unclamped, the read that hangs NVIDIA.
-/// Called before a shader is translated.
-/// shortcut: the limit is the capped heap's last slot whatever size the
-/// title's heap turns out to have; a heap that fits is not capped and
-/// keeps no null slot there (an index past it is as undefined as before).
+/// Asks the host, once, what view-heap size it supports and sets the
+/// null guard slot (`set_view_heap_limit`) before the first shader is
+/// translated so every bindless view index is clamped inside the heap.
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
-        // SAFETY: plain heap creation; the heap is released at once.
-        let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-            host.device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: PORTABLE_VIEWS + 1,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
+        let try_heap = |n: u32| -> windows::core::Result<ID3D12DescriptorHeap> {
+            // SAFETY: plain heap creation; the heap is released at once.
+            unsafe {
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: n,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+            }
         };
-        if made.is_err() {
+        if try_heap(TIER3_VIEWS).is_ok() {
+            tracing::info!(
+                slots = TIER3_VIEWS,
+                null_slot = TIER3_VIEWS - 1,
+                "tier-3 host view heap: clamping bindless view indices to null guard slot"
+            );
+            victory_shader::emit::set_view_heap_limit(TIER3_VIEWS - 1);
+        } else if try_heap(PORTABLE_VIEWS + 1).is_err() {
             tracing::info!("the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on");
             victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
         }
@@ -574,20 +585,40 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count, size) = match make(count + extra) {
-            Ok(heap) => (heap, count, count + extra),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. The heap's last slot stays null, and shaders read it for
-                // any view index from there on (`set_view_heap_limit`): a read past the heap's
-                // end hung NVIDIA's GPU (the title's heap is a little over 1 000 000 views).
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
-                victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra - 1, PORTABLE_VIEWS)
+        let (heap, count, size) = if sampler {
+            let wanted = count.max(MAX_SAMPLERS);
+            match make(wanted) {
+                Ok(heap) => (heap, count, wanted),
+                Err(_) => match make(count) {
+                    Ok(heap) => (heap, count, count),
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
+                },
             }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+        } else {
+            let wanted = (count + extra + 1).max(TIER3_VIEWS);
+            match make(wanted) {
+                Ok(heap) => {
+                    victory_shader::emit::set_view_heap_limit(wanted - 1);
+                    (heap, count, wanted)
+                }
+                Err(_) => match make(count + extra + 1) {
+                    Ok(heap) => {
+                        victory_shader::emit::set_view_heap_limit(count + extra);
+                        (heap, count, count + extra + 1)
+                    }
+                    Err(e) if count + extra > PORTABLE_VIEWS => {
+                        tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
+                        victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+                        (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra - 1, PORTABLE_VIEWS)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
+                },
             }
         };
         // SAFETY: a live heap.
@@ -597,12 +628,12 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, sampler, "host descriptor heap");
+        tracing::debug!(count, size, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(size) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -656,13 +687,17 @@ impl HostHeap {
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
         const BLOCK: u32 = 1 << 16;
+        if total == 0 {
+            return Ok(());
+        }
+        let block_len = total.min(BLOCK);
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
                 host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: BLOCK,
+                    NumDescriptors: block_len,
                     ..Default::default()
                 })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
@@ -675,14 +710,14 @@ impl HostHeap {
                 null_view(start);
             }
             let mut filled = 1;
-            while filled < BLOCK {
-                let n = filled.min(BLOCK - filled);
+            while filled < block_len {
+                let n = filled.min(block_len - filled);
                 host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
                 filled += n;
             }
             let mut done = 0;
             while done < total {
-                let n = BLOCK.min(total - done);
+                let n = block_len.min(total - done);
                 host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
             }

@@ -517,7 +517,7 @@ impl HostPipeline {
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
-                || unsafe { host.device.CreateComputePipelineState(&desc) },
+                || seh_pso(shaders, || unsafe { host.device.CreateComputePipelineState(&desc) }),
             );
             let pso = match made {
                 Ok(pso) => pso,
@@ -557,7 +557,7 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name, shaders) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -648,7 +648,7 @@ impl HostPipeline {
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadGraphicsPipeline(name, desc) },
                 // SAFETY: as above.
-                || unsafe { host.device.CreateGraphicsPipelineState(desc) },
+                || seh_pso(shaders, || unsafe { host.device.CreateGraphicsPipelineState(desc) }),
             )
         };
         let mut made = make(&desc, &name(rect_gs.as_ref()));
@@ -720,6 +720,59 @@ impl HostPipeline {
     }
 }
 
+unsafe extern "C" {
+    fn victory_seh_call(
+        f: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+        ctx: *mut std::ffi::c_void,
+        caught_code: *mut u32,
+    ) -> i32;
+    #[cfg(test)]
+    fn victory_seh_test_fault() -> i32;
+}
+
+/// Runs `f` under an MSVC SEH handler so a driver shader-compiler crash
+/// (such as `amdxc64.dll` null-dereferencing inside `Create*PipelineState`)
+/// turns into an `E_FAIL` refusal instead of killing the title process.
+fn seh_pso<T, F: FnOnce() -> windows::core::Result<T>>(
+    shaders: &[Arc<Shader>],
+    f: F,
+) -> windows::core::Result<T> {
+    struct Ctx<T, F> {
+        f: Option<F>,
+        out: Option<windows::core::Result<T>>,
+    }
+    unsafe extern "C" fn run<T, F: FnOnce() -> windows::core::Result<T>>(
+        raw: *mut std::ffi::c_void,
+    ) -> i32 {
+        // SAFETY: `raw` points to a live `Ctx<T, F>` on `seh_pso`'s stack.
+        let ctx = unsafe { &mut *raw.cast::<Ctx<T, F>>() };
+        if let Some(f) = ctx.f.take() {
+            ctx.out = Some(f());
+        }
+        0
+    }
+    let mut ctx = Ctx {
+        f: Some(f),
+        out: None,
+    };
+    let mut caught = 0u32;
+    // SAFETY: `run` and `ctx` remain valid for the duration of `victory_seh_call`.
+    let hr = unsafe { victory_seh_call(run::<T, F>, (&raw mut ctx).cast(), &raw mut caught) };
+    if caught != 0 || hr < 0 {
+        tracing::warn!(
+            exception = format_args!("{caught:#x}"),
+            ?shaders,
+            "driver compiler exception caught during host PSO creation; refusing pipeline"
+        );
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(hr)));
+    }
+    ctx.out.unwrap_or_else(|| {
+        Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x8000_4005u32 as i32,
+        )))
+    })
+}
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
 ///
@@ -738,6 +791,7 @@ fn mesh_pipeline(
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
     name: &str,
+    shaders: &[Arc<Shader>],
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     /// A stream subobject: its type, then its description, pointer-aligned.
@@ -783,7 +837,7 @@ fn mesh_pipeline(
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.
-        || unsafe { device.CreatePipelineState(&desc) },
+        || seh_pso(shaders, || unsafe { device.CreatePipelineState(&desc) }),
     )
 }
 
@@ -920,12 +974,22 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name, &[]).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name, &[]).expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    #[test]
+    fn seh_pso_catches_driver_compiler_access_violation() {
+        let res = seh_pso::<i32, _>(&[], || {
+            // SAFETY: intentionally faults at 0x8 inside `victory_seh_call`'s `__try` block.
+            Ok(unsafe { victory_seh_test_fault() })
+        });
+        let err = res.expect_err("access violation should be caught as E_FAIL");
+        assert_eq!(err.code().0, 0x8000_4005u32 as i32);
     }
 }

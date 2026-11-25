@@ -65,6 +65,8 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
+                    "VICTORY_HOST_MAX_WAVE",
+                    "VICTORY_VALIDATE_DXIL",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -75,6 +77,8 @@ fn build() -> &'static [u8; 32] {
                 }
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+                // And the view-heap clamp slot baked into `heap_handle`.
+                bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -89,10 +93,43 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+#[cfg(windows)]
+fn validate_dxil(dxil: &mut [u8]) -> Result<(), String> {
+    use std::sync::Mutex;
+    use victory_shader::emit::validator::Validator;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_VALIDATE_DXIL").is_none_or(|v| v != "0")) {
+        return Ok(());
+    }
+    static VALIDATOR: OnceLock<Option<Mutex<Validator>>> = OnceLock::new();
+    let Some(lock) = VALIDATOR.get_or_init(|| {
+        match Validator::load(Validator::default_path().as_deref()) {
+            Ok(v) => Some(Mutex::new(v)),
+            Err(e) => {
+                tracing::warn!(error = %e, "dxil.dll validator unavailable; skipping runtime DXIL check");
+                None
+            }
+        }
+    }) else {
+        return Ok(());
+    };
+    let mut validator = lock.lock().unwrap_or_else(|e| e.into_inner());
+    validator.validate(dxil).map_err(|e| format!("dxil validator: {e}"))
+}
+
+#[cfg(not(windows))]
+fn validate_dxil(_dxil: &mut [u8]) -> Result<(), String> {
+    Ok(())
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let mut shader = victory_shader::emit::translate(c).map_err(|e| e.to_string())?;
+        validate_dxil(&mut shader.dxil)?;
+        Ok(shader)
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),

@@ -40,3 +40,6 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(windows)'.build-dependencies]
+cc = "1"
