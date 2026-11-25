@@ -325,6 +325,13 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        // A diagnostics skip must avoid the driver's compiler/cache too,
+        // not merely drop the draws after compiling a known-bad pipeline.
+        #[cfg(feature = "diagnostics")]
+        if let Some(hash) = super::skipped_shaders(shaders) {
+            tracing::warn!(hash, "pipeline skipped before host compilation");
+            return None;
+        }
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -515,7 +522,7 @@ impl HostPipeline {
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
-                |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+                |library, name| seh_pso(shaders, || unsafe { library.LoadComputePipeline(name, &desc) }),
                 // SAFETY: as above.
                 || seh_pso(shaders, || unsafe { host.device.CreateComputePipelineState(&desc) }),
             );
@@ -646,7 +653,7 @@ impl HostPipeline {
             super::library::pipeline(
                 name,
                 // SAFETY: the description points at live data.
-                |library, name| unsafe { library.LoadGraphicsPipeline(name, desc) },
+                |library, name| seh_pso(shaders, || unsafe { library.LoadGraphicsPipeline(name, desc) }),
                 // SAFETY: as above.
                 || seh_pso(shaders, || unsafe { host.device.CreateGraphicsPipelineState(desc) }),
             )
@@ -731,7 +738,8 @@ unsafe extern "C" {
 }
 
 /// Runs `f` under an MSVC SEH handler so a driver shader-compiler crash
-/// (such as `amdxc64.dll` null-dereferencing inside `Create*PipelineState`)
+/// (such as `amdxc64.dll` null-dereferencing inside `Create*PipelineState`
+/// or a pipeline-library load, which can invoke the compiler too)
 /// turns into an `E_FAIL` refusal instead of killing the title process.
 fn seh_pso<T, F: FnOnce() -> windows::core::Result<T>>(
     shaders: &[Arc<Shader>],
@@ -762,7 +770,7 @@ fn seh_pso<T, F: FnOnce() -> windows::core::Result<T>>(
         tracing::warn!(
             exception = format_args!("{caught:#x}"),
             ?shaders,
-            "driver compiler exception caught during host PSO creation; refusing pipeline"
+            "driver compiler exception caught during host PSO creation or cache load; refusing pipeline"
         );
         return Err(windows::core::Error::from_hresult(windows::core::HRESULT(hr)));
     }
@@ -835,7 +843,7 @@ fn mesh_pipeline(
     super::library::pipeline(
         name,
         // SAFETY: the stream holds whole subobjects pointing at live data.
-        |library, name| unsafe { library.LoadPipeline(name, &desc) },
+        |library, name| seh_pso(shaders, || unsafe { library.LoadPipeline(name, &desc) }),
         // SAFETY: as above.
         || seh_pso(shaders, || unsafe { device.CreatePipelineState(&desc) }),
     )

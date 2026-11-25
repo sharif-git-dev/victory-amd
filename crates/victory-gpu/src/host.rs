@@ -6343,11 +6343,20 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        // Unattended capture runs must not activate or cover the user's
+        // desktop. Rendering and frame capture continue with a hidden HWND.
+        let background = std::env::var_os("VICTORY_BACKGROUND").is_some_and(|v| v == "1");
+        let (extended, style) = if background {
+            tracing::info!("background rendering: hidden window, no activation");
+            (WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW)
+        } else {
+            (WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW | WS_VISIBLE)
+        };
         CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            extended,
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             rect.right - rect.left,

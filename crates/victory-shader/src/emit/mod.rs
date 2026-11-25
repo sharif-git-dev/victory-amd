@@ -88,6 +88,8 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(test, windows))]
 mod heap_scalar_tests;
+#[cfg(all(test, windows))]
+mod signature_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;

@@ -136,6 +136,10 @@ Launch with the experimental AMD RDNA 4 preset (the script keeps its historical 
 scripts\launch-amd-stable.cmd "D:\your-title-folder\title.exe"
 ```
 
+For an unattended test while using the PC, set `VICTORY_BACKGROUND=1` before
+launching. The runtime creates a hidden window without activating it; diagnostics
+frame captures still work. This does not limit its memory or GPU usage.
+
 The latest [prerelease](https://github.com/sharif-git-dev/victory-amd/releases/tag/v0.1.0-amd.1)
 ships only the tested diagnostics runtime, compiled from this open-source
 repository with zero title data. Extract the ZIP and run

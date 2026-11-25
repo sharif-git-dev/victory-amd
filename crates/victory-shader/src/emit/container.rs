@@ -64,6 +64,30 @@ impl SigElement {
     }
 }
 
+/// Give elements with incompatible interpolation modes separate host rows.
+/// Run after lowering: console exports and packed halves still use the
+/// original register layout, while DXIL accesses name signature IDs and
+/// element-relative columns. IDs, semantics, types and modes stay intact.
+pub(crate) fn separate_interpolation_rows(elements: &mut [SigElement]) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut occupied: BTreeSet<u32> = elements.iter().filter_map(|e| e.row).collect();
+    let mut modes = BTreeMap::new();
+    let mut moved = BTreeMap::new();
+    for e in elements {
+        let Some(row) = e.row else { continue };
+        let first = *modes.entry(row).or_insert(e.interp);
+        if first == e.interp {
+            continue;
+        }
+        let target = *moved.entry((row, e.interp)).or_insert_with(|| {
+            let free = (0..).find(|r| !occupied.contains(r)).unwrap();
+            occupied.insert(free);
+            free
+        });
+        e.row = Some(target);
+    }
+}
+
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -90,7 +114,10 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    // The validator orders by register, preserving declaration order for
+    // elements sharing one. Sorting those by column changes the canonical
+    // signature when a later semantic occupies an earlier column.
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;

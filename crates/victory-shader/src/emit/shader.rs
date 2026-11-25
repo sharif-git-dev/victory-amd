@@ -451,6 +451,15 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // The console may pack integer and interpolated float semantics
+        // into one register; DXIL requires a single mode per host row.
+        // Repack only after all console register accesses were lowered.
+        if self.pixel {
+            container::separate_interpolation_rows(&mut self.inputs);
+        } else {
+            container::separate_interpolation_rows(&mut self.outputs);
+            container::separate_interpolation_rows(&mut self.prims);
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
