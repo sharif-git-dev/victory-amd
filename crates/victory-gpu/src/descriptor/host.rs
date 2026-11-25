@@ -482,6 +482,24 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// Metadata for scalar loads through a computed heap index. A zero stride
+/// alone cannot distinguish a CBV from a texture or an uninitialised slot.
+fn slot_info(view: Option<&View>) -> u32 {
+    use victory_shader::emit::{SLOT_STRIDE_CBV, SLOT_STRIDE_MASK, SLOT_STRIDE_UAV};
+    match view {
+        Some(View::Constant(..)) => SLOT_STRIDE_CBV,
+        Some(view) => view_stride(view).map_or(0, |stride| {
+            (stride & SLOT_STRIDE_MASK)
+                | if matches!(view, View::Unordered(..) | View::Placed(true, ..)) {
+                    SLOT_STRIDE_UAV
+                } else {
+                    0
+                }
+        }),
+        None => 0,
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -1076,7 +1094,7 @@ impl HostHeap {
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(slot_info(view)) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -2247,6 +2265,23 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_heap_metadata_distinguishes_descriptor_classes() {
+        use victory_shader::emit::{SLOT_STRIDE_CBV, SLOT_STRIDE_UAV};
+        let buffer = [39, 1, 5768, 0, 0, 0, 16, 0, 1, 0];
+        let srv = View::Shader(0, Some(buffer));
+        let mut uav = [0; 10];
+        uav[0] = 39;
+        uav[1] = 1;
+        uav[4] = 16;
+        uav[8] = 1;
+        assert_eq!(slot_info(Some(&srv)), 1);
+        assert_eq!(slot_info(Some(&View::Unordered(0, 0, Some(uav)))), SLOT_STRIDE_UAV | 1);
+        assert_eq!(slot_info(Some(&View::Constant(0, 256))), SLOT_STRIDE_CBV);
+        assert_eq!(slot_info(Some(&View::Shader(0, Some([2, 4, 5768, 0, 0, 1, 0, 0, 0, 0])))), 0);
+        assert_eq!(slot_info(None), 0);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

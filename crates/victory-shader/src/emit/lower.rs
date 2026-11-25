@@ -5351,16 +5351,23 @@ impl<'a> Lower<'a> {
         // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
-        // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // The host's slot metadata distinguishes SRVs, CBVs and UAVs.
+        // A texture, an absent descriptor or a UAV must not be interpreted
+        // as a CBV: on some drivers that turns descriptor bits into a GPU
+        // address and faults the device. Only the matching load runs.
         let picked = match kind {
-            None => self.slot_stride(src)?,
+            None => self.slot_info(src)?,
             Some(_) => None,
         };
-        if let Some(stride) = picked {
+        if let Some(info) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let mask = self.s.m.i32(super::shader::SLOT_STRIDE_MASK);
+            let stride = self.s.m.bin(self.cur, Bin::And, info, mask);
+            let nonzero = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let class_mask = self.s.m.i32(!super::shader::SLOT_STRIDE_MASK);
+            let class = self.s.m.bin(self.cur, Bin::And, info, class_mask);
+            let srv = self.s.m.cmp(self.cur, pred::EQ, class, zero);
+            let is_buffer = self.s.m.bin(self.cur, Bin::And, nonzero, srv);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -5383,7 +5390,8 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let cbv = self.s.m.i32(super::shader::SLOT_STRIDE_CBV);
+            let other = self.s.m.cmp(self.cur, pred::EQ, info, cbv);
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -6156,6 +6164,15 @@ impl<'a> Lower<'a> {
     /// `ResourceHeap`): read from the host's table by heap slot in the
     /// current block.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        let Some(info) = self.slot_info(src)? else {
+            return Ok(None);
+        };
+        let mask = self.s.m.i32(super::shader::SLOT_STRIDE_MASK);
+        Ok(Some(self.s.m.bin(self.cur, Bin::And, info, mask)))
+    }
+
+    /// The element stride and descriptor class of a directly indexed slot.
+    fn slot_info(&mut self, src: &Source) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };

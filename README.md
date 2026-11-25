@@ -14,6 +14,28 @@ on PC.
 
 ---
 
+## Latest experimental build — 2026-11-25
+
+[Download v0.1.0-amd.1](https://github.com/sharif-git-dev/victory-amd/releases/tag/v0.1.0-amd.1)
+contains the tested Windows x64 **diagnostics** runtime and an AMD launcher.
+This is an experimental build: the latest long run **ended in a GPU page fault
+after approximately 42 minutes 39 seconds**. It is not a stable or fully playable release.
+
+The new descriptor-class guard prevents scalar heap loads from interpreting
+texture, UAV, or missing descriptors as constant buffers. Regression tests cover
+buffer SRVs, CBVs, invalid descriptor classes, and out-of-range indices on both
+hardware and WARP. The shader suite passed **211 tests, with 2 ignored**; the
+host descriptor-metadata test also passed. These are the checks for this update;
+the older full-workspace results below belong to the previous release.
+
+The run passed frame 23,000 with the previously implicated compute shader
+enabled, then faulted during a different indirect mesh dispatch. The launcher
+still skips 31 known pipelines; rendering is incomplete, dark, and typically
+around 0.7–4 fps in 3D scenes. Prologue completion has not been verified.
+See [test results and limitations](docs/experimental-test-results.md).
+
+---
+
 ## Credits & Upstream Lineage
 
 - **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** — foundational PE
@@ -35,7 +57,8 @@ Upstream `victory-fork` was developed and tuned on an NVIDIA RTX 4070 (`WaveLane
 Resource Binding Tier 2 view heap capped at `1,000,000` descriptors). Running unmodified
 on an **AMD Radeon RX 9070 XT** (RDNA 4, `WaveLaneCountMin = 32` / `WaveLaneCountMax = 64`,
 Tier 3 unbounded descriptor heaps) hit three distinct failure modes during loading and the
-opening sequence. This fork resolves all three in runtime code:
+opening sequence. This fork adds mitigations for those failures; further GPU
+faults remain, as documented above:
 
 ### 1. Tier-3 Bindless Descriptor Heap Bounds Clamping (`crates/victory-gpu/src/descriptor/host.rs`)
 - **Root cause (caught via DRED):** NVIDIA caps shader-visible `CBV_SRV_UAV` heaps at
@@ -79,7 +102,7 @@ opening sequence. This fork resolves all three in runtime code:
 
 ---
 
-## Measured Status on AMD Radeon RX 9070 XT
+## Historical measurements: v0.1.0-amd
 
 **Test system:** Windows 11 x64 (build 26300), AMD Radeon RX 9070 XT 16 GB (RDNA 4),
 32 GB RAM, Xbox Series X profile.
@@ -107,15 +130,17 @@ cargo build --release -p victory                                # target\release
 cargo build --profile diag -p victory --features diagnostics    # target\diag\victory.exe (DRED + diagnostics)
 ```
 
-Launch with the stable AMD RDNA 4 preset:
+Launch with the experimental AMD RDNA 4 preset (the script keeps its historical filename):
 
 ```powershell
 scripts\launch-amd-stable.cmd "D:\your-title-folder\title.exe"
 ```
 
-Pre-built Windows x64 runtime binaries (`victory.exe` release + `victory-diag.exe`,
-compiled strictly from this open-source repository with zero title data) are also
-published on the [Releases](../../releases) page.
+The latest [prerelease](https://github.com/sharif-git-dev/victory-amd/releases/tag/v0.1.0-amd.1)
+ships only the tested diagnostics runtime, compiled from this open-source
+repository with zero title data. Extract the ZIP and run
+`launch-amd.cmd "D:\your-title-folder\title.exe"`. The corresponding source is
+available at the release tag. You must supply your own title files separately.
 
 ---
 
